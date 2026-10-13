@@ -1,14 +1,20 @@
-"""Multi-view SVM discriminator f(s, a) with the "a" given as 3D point tracks.
+"""Multi-view SVM discriminators f(s, a). Two variants differ only in how "a"
+enters the head-side token sequence:
+
+  MultiViewTrackSVM   a = 3D point tracks of the head patches
+      self-attention   [CLS], state L/R, head dino x391, track x391     = 785
+  MultiViewActionSVM  a = 16-step commanded EEF pose chunk
+      self-attention   [CLS], state L/R, action L/R, head dino x391     = 396
 
 Head camera tokens form the self-attention sequence; the two wrist cameras are
-a memory every layer cross-attends to.
+a memory every layer cross-attends to:
 
-  self-attention   [CLS], state L/R, head dino x391, track x391        = 785
   cross-attention  left wrist dino x391, right wrist dino x391          = 782
 
 Every token is grounded with a 3D RoPE over world-frame metres: state tokens at
-their arm's EEF xyz, head dino and track tokens at the head patch centre, wrist
-patches at the world xyz unprojected from the wrist depth. In cross-attention q
+their arm's EEF xyz, action tokens at their arm's first commanded xyz, head
+dino and track tokens at the head patch centre, wrist patches at the world xyz
+unprojected from the wrist depth. In cross-attention q
 and k are rotated by their own coordinates, so q.k depends on the 3D offset
 between a head-side token and a wrist patch. Tokens without a valid coordinate
 (CLS, depth-invalid patches) pass through unrotated.
@@ -122,8 +128,9 @@ class MVLayer(nn.Module):
         return x + self.dropout3(self.linear2(self.dropout(self.activation(self.linear1(h)))))
 
 
-class MultiViewTrackSVM(nn.Module):
-    """f(s, track) -> logit (= log f/(1-f))."""
+class _MultiViewSVM(nn.Module):
+    """Shared trunk: CLS, state tokens, wrist memory, layers and readout.
+    Subclasses add the action-side tokens in `_head_side`."""
 
     def __init__(
         self,
@@ -132,7 +139,6 @@ class MultiViewTrackSVM(nn.Module):
         n_heads: int = 8,
         d_ff: int = 3200,
         dropout: float = 0.1,
-        track_temporal_dim: int = 512,
         rope_spatial_scale: float = 0.01,
         rope_spatial_base: float = 100.0,
         arm_dim: int = 8,
@@ -144,6 +150,7 @@ class MultiViewTrackSVM(nn.Module):
         self.d_model = d_model
         self.patch_grid = tuple(patch_grid)
         self.arm_dim = arm_dim
+        self.horizon = horizon
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         self.cls_pos = nn.Embedding(1, d_model)
@@ -151,9 +158,6 @@ class MultiViewTrackSVM(nn.Module):
         self.state_pos = nn.Embedding(2, d_model)
         self.arm_embed = nn.Embedding(2, d_model)  # left=0, right=1
         self.wrist_view_embed = nn.Embedding(N_WRIST, d_model)
-        self.track_temporal_encoder = TrackTemporalEncoder(horizon, track_temporal_dim, d_model)
-        self.invalid_embed = nn.Parameter(torch.zeros(d_model))
-        self.track_type_embed = nn.Parameter(torch.zeros(d_model))
 
         self.layers = nn.ModuleList([MVLayer(d_model, n_heads, d_ff, dropout) for _ in range(n_layers)])
         self.final_norm = nn.LayerNorm(d_model)
@@ -171,6 +175,11 @@ class MultiViewTrackSVM(nn.Module):
             self._grid_pos_cache = sinusoidal_2d(*self.patch_grid, self.d_model, device)
         return self._grid_pos_cache.to(dtype)
 
+    def _head_side(self, batch: dict[str, Tensor], grid: Tensor, head_dino: Tensor, head_c: Tensor,
+                   head_ok: Tensor) -> list[tuple[Tensor, Tensor, Tensor, Tensor]]:
+        """Segments after CLS + state: (tokens [B,n,D], pos [n,D], coords [B,n,3], rope_ok [B,n])."""
+        raise NotImplementedError
+
     def forward(self, batch: dict[str, Tensor]) -> Tensor:
         """`batch` (see `preprocess.build_batch`):
             dino       [B, 3, 391, 1024]  head, left wrist, right wrist
@@ -178,28 +187,23 @@ class MultiViewTrackSVM(nn.Module):
             centre_ok  [B, 3, 391]        bool, depth-valid patch centre
             state      [B, 16]            normalized robot state
             state_xyz  [B, 2, 3]          raw L/R EEF xyz, metres
-            track      [B, 391, 16, 3]    normalized head-patch tracks
-            valid      [B, 391]           bool, track validity
-        Returns logits [B]."""
+        plus the variant's action inputs. Returns logits [B]."""
         dino, centres, centre_ok = batch["dino"], batch["centres"], batch["centre_ok"]
         B = dino.shape[0]
         device, dtype = dino.device, dino.dtype
-        arm = self.arm_embed.weight.unsqueeze(0)
         grid = self._grid_pos(device, dtype)
-        head_dino, head_c, head_ok = dino[:, 0], centres[:, 0], centre_ok[:, 0]
 
-        state_tok = self.state_encoder(batch["state"].reshape(B, 2, self.arm_dim)) + arm
-        valid = batch["valid"]
-        track_tok = self.track_temporal_encoder(batch["track"] * valid[..., None, None])
-        track_tok = track_tok + (~valid)[..., None] * self.invalid_embed + self.track_type_embed
-
-        x = torch.cat([self.cls_token.expand(B, -1, -1).to(dtype), state_tok, head_dino, track_tok], dim=1)
-        pos = torch.cat([self.cls_pos.weight, self.state_pos.weight, grid, grid], dim=0).unsqueeze(0)
-        coords = torch.cat([x.new_zeros(B, 1, 3, dtype=torch.float32), batch["state_xyz"].float(),
-                            head_c.float(), head_c.float()], dim=1)
-        rope_ok = torch.cat([torch.zeros(B, 1, dtype=torch.bool, device=device),
-                             torch.ones(B, 2, dtype=torch.bool, device=device), head_ok, head_ok], dim=1)
-        x_rope = (self.rope.build_cos_sin(coords), rope_ok)
+        state_tok = self.state_encoder(batch["state"].reshape(B, 2, self.arm_dim)) + self.arm_embed.weight
+        segs = [
+            (self.cls_token.expand(B, -1, -1).to(dtype), self.cls_pos.weight,
+             torch.zeros(B, 1, 3, device=device), torch.zeros(B, 1, dtype=torch.bool, device=device)),
+            (state_tok, self.state_pos.weight, batch["state_xyz"], torch.ones(B, 2, dtype=torch.bool, device=device)),
+            *self._head_side(batch, grid, dino[:, 0], centres[:, 0], centre_ok[:, 0]),
+        ]
+        x = torch.cat([s[0] for s in segs], dim=1)
+        pos = torch.cat([s[1] for s in segs], dim=0).unsqueeze(0)
+        x_rope = (self.rope.build_cos_sin(torch.cat([s[2].float() for s in segs], 1)),
+                  torch.cat([s[3] for s in segs], 1))
 
         mem = dino[:, 1:].reshape(B, N_WRIST * grid.shape[0], -1)
         mem_pos = (grid.unsqueeze(0) + self.wrist_view_embed.weight.to(dtype)[:, None]).reshape(1, -1, self.d_model)
@@ -209,3 +213,41 @@ class MultiViewTrackSVM(nn.Module):
         for layer in self.layers:
             x = layer(x, pos, mem, mem_pos, self.rope, x_rope, mem_rope)
         return self.head(self.final_norm(x[:, 0])).squeeze(-1)
+
+
+class MultiViewTrackSVM(_MultiViewSVM):
+    """f(s, track) -> logit. Extra batch keys: track [B,391,16,3] (normalized),
+    valid [B,391] bool. Track tokens sit at their head patch's grid position
+    and 3D coordinate."""
+
+    def __init__(self, track_temporal_dim: int = 512, **kwargs):
+        super().__init__(**kwargs)
+        self.track_temporal_encoder = TrackTemporalEncoder(self.horizon, track_temporal_dim, self.d_model)
+        self.invalid_embed = nn.Parameter(torch.zeros(self.d_model))
+        self.track_type_embed = nn.Parameter(torch.zeros(self.d_model))
+
+    def _head_side(self, batch, grid, head_dino, head_c, head_ok):
+        valid = batch["valid"]
+        track_tok = self.track_temporal_encoder(batch["track"] * valid[..., None, None])
+        track_tok = track_tok + (~valid)[..., None] * self.invalid_embed + self.track_type_embed
+        return [(head_dino, grid, head_c, head_ok), (track_tok, grid, head_c, head_ok)]
+
+
+class MultiViewActionSVM(_MultiViewSVM):
+    """f(s, action chunk) -> logit. Extra batch keys: action [B,16,16]
+    (normalized commanded poses), action_xyz [B,2,3] (raw L/R xyz of the first
+    action, metres). One token per arm = MLP(flatten(16 x 8))."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.action_encoder = nn.Sequential(
+            nn.Linear(self.horizon * self.arm_dim, self.d_model), nn.SiLU(), nn.Linear(self.d_model, self.d_model)
+        )
+        self.action_pos = nn.Embedding(2, self.d_model)
+
+    def _head_side(self, batch, grid, head_dino, head_c, head_ok):
+        B = head_dino.shape[0]
+        chunk = batch["action"].reshape(B, self.horizon, 2, self.arm_dim).transpose(1, 2)
+        act_tok = self.action_encoder(chunk.reshape(B, 2, self.horizon * self.arm_dim)) + self.arm_embed.weight
+        act_ok = torch.ones(B, 2, dtype=torch.bool, device=head_dino.device)
+        return [(act_tok, self.action_pos.weight, batch["action_xyz"], act_ok), (head_dino, grid, head_c, head_ok)]

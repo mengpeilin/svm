@@ -8,7 +8,9 @@ Conventions (all must match training, see README "Inputs"):
   state    16-D [L xyz, L quat(wxyz), L grip, R xyz, R quat(wxyz), R grip], world frame
   track    [391, 16, 3] world-frame displacement of each head patch's 3D point
            from t to t+h+1 (h = 0..15), metres; `track_valid` [391] marks the
-           patches whose point is tracked
+           patches whose point is tracked                       (track model)
+  action   [16, 16] commanded EEF poses of the chunk, each in the `state`
+           format                                               (action model)
 """
 
 from __future__ import annotations
@@ -67,27 +69,35 @@ def dino_features(model: torch.nn.Module, rgb: np.ndarray, device) -> torch.Tens
 
 
 class Normalizer:
-    """State: per-dim min/max -> [-1, 1]. Tracks: one isotropic scale x / rms.
-    DINO features and patch centres are used raw (centres feed RoPE in metres)."""
+    """State / action: per-dim min/max -> [-1, 1]. Tracks: one isotropic scale
+    x / rms. DINO features and patch centres are used raw (centres feed RoPE in
+    metres). Each checkpoint stores the statistics of the inputs it reads."""
 
-    def __init__(self, state_lo, state_hi, track_rms, **_):
+    def __init__(self, state_lo, state_hi, track_rms=None, action_lo=None, action_hi=None):
         self.state_lo = np.asarray(state_lo, dtype=np.float32)
         self.state_hi = np.asarray(state_hi, dtype=np.float32)
-        self.track_rms = float(track_rms)
+        self.track_rms = track_rms
+        self.action_lo = np.asarray(action_lo, dtype=np.float32) if action_lo is not None else None
+        self.action_hi = np.asarray(action_hi, dtype=np.float32) if action_hi is not None else None
 
     def state_norm(self, x: np.ndarray) -> np.ndarray:
         return 2.0 * (x - self.state_lo) / (self.state_hi - self.state_lo) - 1.0
+
+    def action_norm(self, x: np.ndarray) -> np.ndarray:
+        return 2.0 * (x - self.action_lo) / (self.action_hi - self.action_lo) - 1.0
 
     def track_norm(self, x: np.ndarray) -> np.ndarray:
         return x / self.track_rms
 
 
-def build_batch(obs: dict[str, np.ndarray], dino: torch.Tensor, norm: Normalizer, device) -> dict[str, torch.Tensor]:
+def build_batch(obs: dict[str, np.ndarray], dino: torch.Tensor, norm: Normalizer, device,
+                inputs: str) -> dict[str, torch.Tensor]:
     """Model batch for B decision steps.
 
     `obs` holds per-step arrays with a leading batch dim B: `{cam}_depth`,
-    `{cam}_K`, `{cam}_E` for cam in (head, left_wrist, right_wrist), plus
-    `state` [B, 16], `track` [B, 391, 16, 3], `track_valid` [B, 391].
+    `{cam}_K`, `{cam}_E` for cam in (head, left_wrist, right_wrist), `state`
+    [B, 16], and for `inputs="track"` `track` [B, 391, 16, 3] + `track_valid`
+    [B, 391], for `inputs="action"` `action` [B, 16, 16].
     `dino` is [B, 3, 391, 1024] (head, left wrist, right wrist)."""
     B = len(obs["state"])
     centres = np.zeros((B, 3, N_PATCHES, 3), np.float32)
@@ -97,12 +107,23 @@ def build_batch(obs: dict[str, np.ndarray], dino: torch.Tensor, norm: Normalizer
             centres[i, v], centre_ok[i, v] = patch_centres(obs[f"{cam}_depth"][i], obs[f"{cam}_K"][i], obs[f"{cam}_E"][i])
     state = np.asarray(obs["state"], np.float32)
     t = lambda a, d=torch.float32: torch.as_tensor(a, dtype=d, device=device)  # noqa: E731
-    return {
+    batch = {
         "dino": dino.to(device=device, dtype=torch.float32),
         "centres": t(centres),
         "centre_ok": t(centre_ok, torch.bool),
         "state": t(norm.state_norm(state)),
-        "state_xyz": t(np.stack([state[:, 0:3], state[:, ARM_DIM : ARM_DIM + 3]], axis=1)),
-        "track": t(norm.track_norm(np.asarray(obs["track"], np.float32))),
-        "valid": t(obs["track_valid"], torch.bool),
+        "state_xyz": t(arm_xyz(state)),
     }
+    if inputs == "track":
+        batch["track"] = t(norm.track_norm(np.asarray(obs["track"], np.float32)))
+        batch["valid"] = t(obs["track_valid"], torch.bool)
+    else:
+        action = np.asarray(obs["action"], np.float32)
+        batch["action"] = t(norm.action_norm(action))
+        batch["action_xyz"] = t(arm_xyz(action[:, 0]))
+    return batch
+
+
+def arm_xyz(vec16: np.ndarray) -> np.ndarray:
+    """[B, 16] -> [B, 2, 3] raw world-frame L/R EEF xyz (RoPE coordinates)."""
+    return np.stack([vec16[:, 0:3], vec16[:, ARM_DIM : ARM_DIM + 3]], axis=1)

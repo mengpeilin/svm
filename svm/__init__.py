@@ -1,4 +1,4 @@
-from .model import MultiViewTrackSVM
-from .reward_model import MVTrackSVMReward, svm_reward
+from .model import MultiViewActionSVM, MultiViewTrackSVM
+from .reward_model import MVActionSVMReward, MVTrackSVMReward, svm_reward
 
-__all__ = ["MultiViewTrackSVM", "MVTrackSVMReward", "svm_reward"]
+__all__ = ["MultiViewActionSVM", "MultiViewTrackSVM", "MVActionSVMReward", "MVTrackSVMReward", "svm_reward"]

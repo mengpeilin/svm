@@ -1,4 +1,4 @@
-"""End-to-end scorer: raw multi-view observation + track -> SVM logit / dense reward."""
+"""End-to-end scorers: raw multi-view observation + track / action chunk -> SVM logit / dense reward."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from safetensors.torch import load_file
 
-from .model import MultiViewTrackSVM
+from .model import MultiViewActionSVM, MultiViewTrackSVM
 from .preprocess import Normalizer, build_batch, dino_features, load_dino
 
 CAMERAS = ("head", "left_wrist", "right_wrist")
@@ -21,7 +21,10 @@ def svm_reward(logit: torch.Tensor | np.ndarray, lam: float = 0.1, beta: float =
     return lam * logit.clip(-beta, beta)
 
 
-class MVTrackSVMReward:
+class _MVSVMReward:
+    model_cls: type
+    inputs: str
+
     def __init__(self, ckpt_dir: str | Path, device: str | None = None, dino: torch.nn.Module | None = None):
         """`ckpt_dir` holds `model.safetensors` + `config.json`. Pass `dino`
         to share a DINOv2-reg ViT-L/14 you already have loaded (e.g. the GAP
@@ -29,13 +32,13 @@ class MVTrackSVMReward:
         ckpt_dir = Path(ckpt_dir)
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.config = json.loads((ckpt_dir / "config.json").read_text())
-        self.model = MultiViewTrackSVM(**self.config["model_config"]).to(self.device).eval()
+        self.model = self.model_cls(**self.config["model_config"]).to(self.device).eval()
         self.model.load_state_dict(load_file(ckpt_dir / "model.safetensors"))
         self.norm = Normalizer(**self.config["normalizer"])
         self.dino = dino if dino is not None else load_dino(self.device)
 
     @classmethod
-    def from_pretrained(cls, repo_id: str, **kwargs) -> "MVTrackSVMReward":
+    def from_pretrained(cls, repo_id: str, **kwargs) -> "_MVSVMReward":
         from huggingface_hub import snapshot_download
 
         return cls(snapshot_download(repo_id), **kwargs)
@@ -46,7 +49,8 @@ class MVTrackSVMReward:
 
         `obs` keys (leading dim B): `{cam}_rgb` [240,320,3] uint8, `{cam}_depth`
         [240,320] mm, `{cam}_K` [3,3], `{cam}_E` [3,4] world->cam for cam in
-        CAMERAS; `state` [16]; `track` [391,16,3] m; `track_valid` [391] bool.
+        CAMERAS; `state` [16]; then `track` [391,16,3] m + `track_valid` [391]
+        bool (track model) or `action` [16,16] commanded poses (action model).
         `head_dino` [B,391,1024] skips re-extracting the head features when the
         policy already computed them."""
         out = []
@@ -55,10 +59,24 @@ class MVTrackSVMReward:
             feats = [torch.as_tensor(np.asarray(head_dino[s : s + chunk], np.float32), device=self.device)
                      if head_dino is not None else dino_features(self.dino, o["head_rgb"], self.device)]
             feats += [dino_features(self.dino, o[f"{c}_rgb"], self.device) for c in CAMERAS[1:]]
-            batch = build_batch(o, torch.stack(feats, 1), self.norm, self.device)
+            batch = build_batch(o, torch.stack(feats, 1), self.norm, self.device, self.inputs)
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.device.startswith("cuda")):
                 out.append(self.model(batch).float().cpu().numpy())
         return np.concatenate(out)
 
     def rewards(self, obs: dict[str, np.ndarray], lam: float = 0.1, beta: float = 20.0, **kwargs) -> np.ndarray:
         return svm_reward(self.logits(obs, **kwargs), lam, beta)
+
+
+class MVTrackSVMReward(_MVSVMReward):
+    """a = 3D point tracks of the head patches (HF: Mercury007/mv-track-svm-scan-object)."""
+
+    model_cls = MultiViewTrackSVM
+    inputs = "track"
+
+
+class MVActionSVMReward(_MVSVMReward):
+    """a = 16-step commanded EEF pose chunk (HF: Mercury007/mv-action-svm-scan-object)."""
+
+    model_cls = MultiViewActionSVM
+    inputs = "action"

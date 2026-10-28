@@ -1,19 +1,19 @@
 """Value videos of eval episodes: the cameras (head 2x, both wrists on the
 right) above one chart of the ABSOLUTE value 16 frames ahead, every `--step`
-frames:
+frames, for one task:
 
   orange  teacher T_{t+16}
   blue    student forecast V(s_t, track_t)
 
 Both are drawn at the decision frame t and held for `--step` frames, shown
 once that step starts. The title gives the episode's MSE between the two over
-t >= 16. Episodes: `--n` success + `--n` failure eval episodes drawn with
-`--seed`, never one in `--exclude`; failures are cut at the failure cap. Needs
-`infer.py`'s eval_frames.npz and the scan parts (camera images).
+t >= 16. Episodes: `--n` success + `--n` failure eval episodes of `--task`
+drawn with `--seed`, never one in `--exclude`. Needs `infer.py`'s
+eval_frames.npz; the camera images come from the base root's rgb_u8.npy.
 
-Writes runs/<run>/videos/{success|failure}_ep{ep}.mp4 (H.264 from RGB frames).
+Writes runs/<run>/videos/<task>/{success|failure}_ep{ep}.mp4 (H.264 from RGB frames).
 
-    python -m mv_distill.render --run student --n 5 --seed 1
+    python -m mv_distill.render --run student --task hanging_mug --n 5 --seed 1
 """
 
 from __future__ import annotations
@@ -22,14 +22,11 @@ import argparse
 
 import av
 import cv2
-import h5py
 import numpy as np
 
-from .config import CHUNK, FAILURE, FAILURE_CAP, SUCCESS, parts, run_dir
-from .data import Cache
-from .parts import episode_plan
+from .config import CHUNK, FAILURE, SUCCESS, TASKS, data_dir, roots, run_dir
+from .data import task_episodes
 
-VIEWS = ("image", "left_wrist_image", "right_wrist_image")
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 BG, INK, MUTED = (24, 24, 24), (235, 235, 235), (150, 150, 150)   # RGB
 TEACHER, STUDENT = (255, 170, 60), (90, 170, 255)
@@ -111,6 +108,7 @@ def render(video, curves, names, colors, step, out_path, title, fps, vrange) -> 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--run", default="student")
+    p.add_argument("--task", choices=TASKS, required=True)
     p.add_argument("--n", type=int, default=5, help="eval episodes per class")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--exclude", type=int, nargs="*", default=[], help="episodes never drawn")
@@ -120,25 +118,26 @@ def main() -> None:
     args = p.parse_args()
 
     z = np.load(run_dir(args.run) / "eval_frames.npz")
-    dec = z["t"] % args.step == 0
+    tasks = [str(t) for t in z["tasks"]]
+    if args.task not in tasks:
+        raise SystemExit(f"runs/{args.run} was not trained on {args.task}")
+    dec = (z["t"] % args.step == 0) & (z["task"] == tasks.index(args.task))
     ep_of, t_of, gt, forecast = z["episode"][dec], z["t"][dec], z["T_next"][dec], z["forward"][dec]
-    cache = Cache("scan", wrist=False)
-    srcs = parts("scan")
-    plan, ends = episode_plan(srcs)
-    if not np.array_equal(ends, cache.bounds[:, 1]):
-        raise SystemExit("scan parts do not reproduce the scan cache's episodes")
-    out_dir = run_dir(args.run) / "videos"
-    out_dir.mkdir(exist_ok=True)
+    base = roots()[0]                                                  # eval episodes are base episodes
+    bounds, splits = task_episodes(base, args.task, True)
+    rgb = np.load(data_dir(base, args.task) / "rgb_u8.npy", mmap_mode="r")   # [N, 3 views, H, W, 3]
+    out_dir = run_dir(args.run) / "videos" / args.task
+    out_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(args.seed)
 
     rows = []
     for label, cls in ((SUCCESS, "success"), (FAILURE, "failure")):
-        eps = [e for e in cache.splits[(label, "eval")] if e not in args.exclude]
+        eps = [e for e in splits[(label, "eval")] if e not in args.exclude]
         for ep in sorted(rng.choice(eps, args.n, replace=False).tolist()):
-            k, s, e = plan[ep]
-            n = e - s if label == SUCCESS else min(e - s, FAILURE_CAP)
-            with h5py.File(srcs[k], "r") as f:
-                video = [f[view][s:s + n] for view in VIEWS]
+            s, e = bounds[ep]
+            n = e - s
+            frames = np.asarray(rgb[s:e])
+            video = [frames[:, v] for v in range(frames.shape[1])]
             m = ep_of == ep
             ys, scored = [gt[m], forecast[m]], t_of[m] >= CHUNK
             mse = float(np.mean((ys[1][scored] - ys[0][scored]) ** 2))
@@ -146,7 +145,7 @@ def main() -> None:
             render(video, [held(t_of[m], y, n, args.step) for y in ys],
                    ["teacher T(t+16)", "student V(s_t, track_t)"], [TEACHER, STUDENT], args.step,
                    out_dir / f"{cls}_ep{ep}.mp4",
-                   f"{cls} ep{ep} [value of s(t+16), every {args.step} frames]  MSE (t >= 16): {mse:.2f}",
+                   f"{args.task} {cls} ep{ep} [value of s(t+16), every {args.step} frames]  MSE (t >= 16): {mse:.2f}",
                    args.fps, args.value_range)
     print("\n| class | ep | MSE (t >= 16) |\n|---|---|---|")
     for cls, ep, mse in rows:

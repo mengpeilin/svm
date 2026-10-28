@@ -209,15 +209,22 @@ class MultiViewDiscriminator(nn.Module):
 
 
 def build(config: dict) -> MultiViewDiscriminator:
-    return MultiViewDiscriminator(**config)
+    """`config`: {"arch": "dino", **MultiViewDiscriminator kwargs}."""
+    assert config["arch"] == "dino", config
+    return MultiViewDiscriminator(**{k: v for k, v in config.items() if k != "arch"})
 
 
-def load(path, device) -> tuple[MultiViewDiscriminator, dict]:
-    """A checkpoint written by train_teacher / train_student: (model in eval mode, checkpoint dict)."""
-    ck = torch.load(path, map_location=device, weights_only=False)
-    model = build(ck["config"]).to(device).eval()
+def load(path, device) -> tuple[nn.Module, dict]:
+    """A checkpoint written by train_teacher / train_student: (model in eval
+    mode, checkpoint dict); config["arch"] picks the DinoV2 model or the
+    Qwen-3D student (`qwen_model.py`)."""
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    if ck["config"]["arch"] == "qwen3d":
+        from .qwen_model import from_checkpoint
+        return from_checkpoint(ck, device).eval(), ck
+    model = build(ck["config"])
     model.load_state_dict(ck["model"])
-    return model, ck
+    return model.to(device).eval(), ck
 
 
 @torch.no_grad()

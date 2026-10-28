@@ -1,14 +1,14 @@
 """Metrics. The dense ones are CLASS-BALANCED: success and failure frames
-weigh 1/2 each (failure episodes run to the cap, so they hold ~2/3 of the
-eval frames).
+weigh 1/2 each (failure episodes run to the truncation length, so they
+hold more of the eval frames).
 
-  RMSE         sqrt(MSE(r, g)) of the student's progress reward r = V(s_t,
-               track_t) - V(s_t) against the teacher's g = T_{t+16} - T_t, in
+  RMSE         sqrt(MSE(V(s_t, track_t), T_{t+16})) of the student's forecast
+               of the value 16 frames ahead against the teacher's, in
                teacher-logit units (lower is better)
-  reverse acc  on the chunks the teacher says make progress (g > 0.5), the
-               share where r with the real track beats r with the reversed
-               track (-track, same observation): 0.5 = blind to the motion's
-               direction
+  reverse acc  on the chunks the teacher says make progress
+               (g = T_{t+16} - T_t > 0.5), the share where the forecast with the
+               real track beats the one with the reversed track (-track, same
+               observation): 0.5 = blind to the motion's direction
 """
 
 from __future__ import annotations

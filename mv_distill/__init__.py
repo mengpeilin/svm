@@ -1,1 +1,1 @@
-"""Multi-view value distillation for scan_object (see README.md)."""
+"""Multi-view value distillation, cotrained over the staged SVM tasks (see README.md)."""

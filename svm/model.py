@@ -170,6 +170,13 @@ class _MultiViewSVM(nn.Module):
                            spatial_scale=rope_spatial_scale)
         self._grid_pos_cache: Optional[Tensor] = None
 
+    def _init_weights(self) -> None:
+        """Training init: learned tokens (CLS, track type / invalid) and every
+        embedding table ~ trunc_normal(std 0.02); all else PyTorch defaults.
+        Subclasses call it once their own parameters exist."""
+        for p in (*self._parameters.values(), *(m.weight for m in self.modules() if isinstance(m, nn.Embedding))):
+            nn.init.trunc_normal_(p, std=0.02)
+
     def _grid_pos(self, device, dtype) -> Tensor:
         if self._grid_pos_cache is None or self._grid_pos_cache.device != device:
             self._grid_pos_cache = sinusoidal_2d(*self.patch_grid, self.d_model, device)
@@ -225,6 +232,7 @@ class MultiViewTrackSVM(_MultiViewSVM):
         self.track_temporal_encoder = TrackTemporalEncoder(self.horizon, track_temporal_dim, self.d_model)
         self.invalid_embed = nn.Parameter(torch.zeros(self.d_model))
         self.track_type_embed = nn.Parameter(torch.zeros(self.d_model))
+        self._init_weights()
 
     def _head_side(self, batch, grid, head_dino, head_c, head_ok):
         valid = batch["valid"]
@@ -244,6 +252,7 @@ class MultiViewActionSVM(_MultiViewSVM):
             nn.Linear(self.horizon * self.arm_dim, self.d_model), nn.SiLU(), nn.Linear(self.d_model, self.d_model)
         )
         self.action_pos = nn.Embedding(2, self.d_model)
+        self._init_weights()
 
     def _head_side(self, batch, grid, head_dino, head_c, head_ok):
         B = head_dino.shape[0]

@@ -24,7 +24,7 @@ tracks, so it is the easier one to plug into an RL loop.
 ## Install
 
 ```bash
-pip install -r requirements.txt     # torch, numpy, opencv-python, safetensors, huggingface_hub
+pip install -r requirements.txt     # torch, numpy, opencv-python, safetensors, huggingface_hub, h5py
 ```
 
 DINOv2 (ViT-L/14 with registers) is loaded from `torch.hub` (`facebookresearch/dinov2`)
@@ -140,6 +140,47 @@ Known limitations:
   **useless for ranking candidate actions at test time**. The track model
   likewise uses the track mostly as a motion-magnitude cue.
 
+## Training
+
+Three steps, all run from the repo root. The input is a set of RoboTwin collector
+parts: HDF5 files of whole episodes, concatenated along a frame axis with
+`episode_ends`, `episode_seed` and `episode_success`. Per frame they hold
+`robot_state`, `action`, `success_cond_uniform` (the episode's 0/1 label),
+the head camera (`image`, `depth`, `camera_intrinsic`, `camera_extrinsic`,
+`dino_features`, `image_patch_centre_3d_position`, `3d_track`,
+`valid_point_mask`) and both wrist cameras (`{left,right}_wrist_{image,depth,intrinsic,extrinsic}`).
+
+```bash
+# 1. cache: decision frames only, uncompressed memmaps (scan_object, 1008 episodes: 43 GB)
+python -m svm.cache --cache cache/scan_object geometry --parts parts/scan_wdepth-*.hdf5   # CPU
+python -m svm.cache --cache cache/scan_object dino                                        # GPU, wrist DINOv2
+rm cache/scan_object/rgb_u8.npy                                                           # only the dino stage reads it
+
+# 2. train (one A6000: track ~2 min / epoch, action ~1.3 min / epoch)
+python -m svm.train --cache cache/scan_object --inputs track  --out runs/track
+python -m svm.train --cache cache/scan_object --inputs action --out runs/action
+
+# 3. score the held-out episodes -> runs/track/rewards.npz + metrics.json
+python -m svm.evaluate --cache cache/scan_object --model track --ckpt runs/track
+```
+
+- **Split.** The cache orders episodes by class, then by seed. The last
+  `--holdout 50` episodes of each class (the highest seeds) are held out. Every
+  epoch they are scored, and the epoch with the lowest held-out loss is kept,
+  so the held-out numbers are mildly optimistic. Failures are cut to their first
+  `--failure-cap 250` frames everywhere.
+- **Objective.** BCE with symmetric batches: 32 success and 32 failure decision
+  steps per step. AdamW 1e-4, weight decay 1e-6, 100 warmup steps then cosine
+  decay, bf16. An epoch is 150 steps. Training stops after `--patience 5`
+  epochs without improvement in the held-out loss (balanced BCE).
+- **Output.** `--out` gets `model.safetensors` + `config.json` (the normalizer
+  is fit on the train steps) and `train_history.json`. A run directory loads
+  like the released checkpoints:
+  `MVTrackSVMReward("runs/track")` and `MVActionSVMReward("runs/action")`.
+  Pass `--wandb-project <name>` to log curves to wandb (`pip install wandb`).
+- `svm.evaluate --ckpt` also takes a Hugging Face repo id. On the scan_object
+  cache it reproduces the table above for the released models.
+
 ## Files
 
 ```
@@ -147,6 +188,11 @@ svm/model.py          MultiViewTrackSVM, MultiViewActionSVM (networks only)
 svm/rope3d.py         3D RoPE
 svm/preprocess.py     patch centres from depth, DINOv2 features, normalization, batch assembly
 svm/reward_model.py   MVTrackSVMReward, MVActionSVMReward: load checkpoint, obs -> logits / rewards
+svm/cache.py          collector HDF5 parts -> training cache
+svm/data.py           cache loading, train / held-out split, normalizer fit, batches
+svm/train.py          training
+svm/evaluate.py       held-out scoring -> rewards.npz, metrics.json
+svm/metrics.py        AUC / early per-chunk AUC / progress metrics
 examples/score_episode.py
 ```
 

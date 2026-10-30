@@ -25,6 +25,7 @@ N_PATCHES = PATCH_GRID[0] * PATCH_GRID[1]  # 391
 IMG_HW = (240, 320)
 DINO_HW = (PATCH_GRID[0] * 14, PATCH_GRID[1] * 14)  # 238 x 322
 ARM_DIM = 8
+CHUNK = 16  # actions GAP executes per decision = track horizon; one sample per chunk
 
 
 def patch_pixel_centres() -> np.ndarray:
@@ -88,6 +89,15 @@ class Normalizer:
 
     def track_norm(self, x: np.ndarray) -> np.ndarray:
         return x / self.track_rms
+
+    def state_dict(self) -> dict:
+        """The `config.json` "normalizer" entry (the constructor's kwargs)."""
+        d = {"state_lo": self.state_lo.tolist(), "state_hi": self.state_hi.tolist()}
+        if self.track_rms is not None:
+            d["track_rms"] = float(self.track_rms)
+        if self.action_lo is not None:
+            d |= {"action_lo": self.action_lo.tolist(), "action_hi": self.action_hi.tolist()}
+        return d
 
 
 def build_batch(obs: dict[str, np.ndarray], dino: torch.Tensor, norm: Normalizer, device,

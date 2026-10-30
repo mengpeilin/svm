@@ -3,4 +3,4 @@ numpy
 opencv-python
 safetensors
 huggingface_hub
-h5py  # examples/score_episode.py only
+h5py  # svm/cache.py, examples/score_episode.py

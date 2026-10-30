@@ -13,6 +13,17 @@ from .model import MultiViewActionSVM, MultiViewTrackSVM
 from .preprocess import Normalizer, build_batch, dino_features, load_dino
 
 CAMERAS = ("head", "left_wrist", "right_wrist")
+MODELS = {"track": MultiViewTrackSVM, "action": MultiViewActionSVM}
+
+
+def load_model(ckpt_dir: str | Path, inputs: str, device) -> tuple[torch.nn.Module, Normalizer, dict]:
+    """(model in eval mode, normalizer, config) from a checkpoint dir holding
+    `model.safetensors` + `config.json` (as written by `svm.train`)."""
+    ckpt_dir = Path(ckpt_dir)
+    config = json.loads((ckpt_dir / "config.json").read_text())
+    model = MODELS[inputs](**config["model_config"]).to(device).eval()
+    model.load_state_dict(load_file(ckpt_dir / "model.safetensors"))
+    return model, Normalizer(**config["normalizer"]), config
 
 
 def svm_reward(logit: torch.Tensor | np.ndarray, lam: float = 0.1, beta: float = 20.0):
@@ -22,19 +33,14 @@ def svm_reward(logit: torch.Tensor | np.ndarray, lam: float = 0.1, beta: float =
 
 
 class _MVSVMReward:
-    model_cls: type
     inputs: str
 
     def __init__(self, ckpt_dir: str | Path, device: str | None = None, dino: torch.nn.Module | None = None):
         """`ckpt_dir` holds `model.safetensors` + `config.json`. Pass `dino`
         to share a DINOv2-reg ViT-L/14 you already have loaded (e.g. the GAP
         policy's); otherwise one is loaded from torch.hub."""
-        ckpt_dir = Path(ckpt_dir)
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.config = json.loads((ckpt_dir / "config.json").read_text())
-        self.model = self.model_cls(**self.config["model_config"]).to(self.device).eval()
-        self.model.load_state_dict(load_file(ckpt_dir / "model.safetensors"))
-        self.norm = Normalizer(**self.config["normalizer"])
+        self.model, self.norm, self.config = load_model(ckpt_dir, self.inputs, self.device)
         self.dino = dino if dino is not None else load_dino(self.device)
 
     @classmethod
@@ -71,12 +77,10 @@ class _MVSVMReward:
 class MVTrackSVMReward(_MVSVMReward):
     """a = 3D point tracks of the head patches (HF: Mercury007/mv-track-svm-scan-object)."""
 
-    model_cls = MultiViewTrackSVM
     inputs = "track"
 
 
 class MVActionSVMReward(_MVSVMReward):
     """a = 16-step commanded EEF pose chunk (HF: Mercury007/mv-action-svm-scan-object)."""
 
-    model_cls = MultiViewActionSVM
     inputs = "action"
